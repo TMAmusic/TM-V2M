@@ -74,6 +74,10 @@ button.primary{background:var(--accent);border-color:var(--accent);color:var(--a
 .beats i:first-child.on{background:var(--rec);border-color:var(--rec)}
 .check.inline{display:flex;align-items:center;gap:6px;font-size:.88rem}
 .check.inline input{accent-color:var(--accent);width:17px;height:17px}
+.latbox{display:flex;align-items:center;gap:6px;font-size:.88rem}
+.latbox #lat{width:86px;font-family:var(--f-mono);font-variant-numeric:tabular-nums}
+.nudge{display:flex;gap:4px}
+.nudge button{flex:1;min-height:34px;padding:6px 4px;justify-content:center;font-family:var(--f-mono);font-weight:500;font-size:.82rem}
 .status{font-size:.88rem;color:var(--muted);flex-basis:100%}
 .status.warn{color:var(--rec)}
 .rollhead{display:flex;flex-wrap:wrap;align-items:center;gap:8px 10px;margin-bottom:10px}
@@ -175,6 +179,8 @@ td.n{font-weight:500;color:var(--accent)}
       <div class="bpmbox"><input id="bpm" type="number" min="30" max="300" step="1" value="100" aria-label="Tempo in BPM"><span>BPM</span></div>
       <div class="beats" aria-hidden="true"><i></i><i></i><i></i><i></i></div>
       <label class="check inline"><input id="countin" type="checkbox" checked>1 Takt einzählen</label>
+      <label class="latbox" for="lat" title="Verzögerung von Kopfhörer, Interface und Mikrofon. Leer = automatisch.">Latenz <input id="lat" type="number" min="-100" max="800" step="1" placeholder="auto" inputmode="numeric"> ms</label>
+      <button id="calBtn" type="button" title="Zwölf Klicks lang «ta» mitsingen. Misst die Verzögerung deines Setups.">Messen</button>
     </div>
     <div class="status" id="status" role="status"></div>
   </section>
@@ -245,9 +251,13 @@ td.n{font-weight:500;color:var(--accent)}
           <input id="split" type="range" min="0.3" max="1.5" step="0.1" value="0.7"></div>
         <div class="ctrl"><label for="transpose">Transponieren</label>
           <select id="transpose"></select></div>
+        <div class="ctrl"><label>Timing <output id="shiftOut">0 ms</output></label>
+          <div class="nudge" role="group" aria-label="Aufnahme und Noten verschieben">
+            <button id="sh-50" type="button" title="50 ms früher">−50</button><button id="sh-10" type="button" title="10 ms früher">−10</button><button id="sh10" type="button" title="10 ms später">+10</button><button id="sh50" type="button" title="50 ms später">+50</button>
+          </div></div>
         <div class="ctrl check"><input id="tune" type="checkbox" checked><label for="tune" style="text-transform:none;letter-spacing:0;font-size:.9rem;color:var(--ink)">Intonation ausgleichen</label></div>
       </div>
-      <p class="hint">«Intonation ausgleichen» misst, wie weit die ganze Aufnahme neben der 440-Hz-Stimmung liegt, und korrigiert das vor dem Runden. Hilft bei konsequent leicht zu tief oder zu hoch gesungenen Melodien.</p>
+      <p class="hint">«Timing» verschiebt Aufnahme und Noten gemeinsam, etwa für Aufnahmen, die vor der Latenz-Messung entstanden sind. «Intonation ausgleichen» misst, wie weit die ganze Aufnahme neben der 440-Hz-Stimmung liegt, und korrigiert das vor dem Runden. Hilft bei konsequent leicht zu tief oder zu hoch gesungenen Melodien.</p>
     </section>
 
     <section class="panel" aria-label="Notenliste">
@@ -276,6 +286,7 @@ const audio = () => (ctx ||= new (window.AudioContext || window.webkitAudioConte
 let samples = null;       // Float32Array @ SR (mono)
 let frames = [];          // {t, f0, midi, rms}
 let notes = [];           // {start, end, midi, vel}
+let tShift = 0;           // seconds the audio (and its notes) are moved on the timeline
 let srcName = "aufnahme";
 let isDemo = false;
 let playing = null;       // {stop(), t0, kind}
@@ -301,12 +312,13 @@ function yin(buf, sr, off, d) {
 }
 
 function analyse(x) {
-  const out = [], d = new Float32Array(FRAME);
+  const out = [], d = new Float32Array(FRAME), EW = 80; // EW: half of a 10 ms energy window
   for (let off = 0; off + FRAME <= x.length; off += HOP) {
     let e = 0; for (let i = 0; i < FRAME; i++) e += x[off + i] * x[off + i];
     const rms = Math.sqrt(e / FRAME);
     const f0 = rms > 1e-4 ? yin(x, SR, off, d) : 0;
-    out.push({ t: (off + FRAME / 2) / SR, f0, midi: f0 ? 69 + 12 * Math.log2(f0 / 440) : null, rms });
+    const c = off + FRAME / 2; let es = 0; for (let i = c - EW; i < c + EW; i++) es += x[i] * x[i];
+    out.push({ t: c / SR, f0, midi: f0 ? 69 + 12 * Math.log2(f0 / 440) : null, rms, es: Math.sqrt(es / (2 * EW)) });
   }
   return out;
 }
@@ -341,19 +353,27 @@ function segment() {
   }
   close(frames.length);
   const tH = HOP / SR / 2;
-  let segs = raw.map(s => {
+  let segs = raw.map((s, k) => {
     const p = s.idx.map(j => sm[j]);
     const db = 20 * Math.log10(Math.max(1e-6, Math.max(...s.idx.map(j => frames[j].rms)) / peak));
-    return { start: frames[s.startIdx].t - tH, end: frames[Math.min(s.endIdx, frames.length) - 1].t + tH, pitch: median(p), db };
+    // a note after a pause starts where its energy rises, not where the pitch becomes stable
+    let si = s.startIdx;
+    const prevEnd = k ? raw[k - 1].endIdx : 0;
+    if (si - prevEnd >= 2) {
+      let pk = 0; for (let j = si; j < Math.min(frames.length, si + 8); j++) pk = Math.max(pk, frames[j].es);
+      const thr = pk * 0.25, lo = Math.max(prevEnd, si - 15);
+      while (si - 1 >= lo && frames[si - 1].es >= thr) si--;
+    }
+    return { start: frames[si].t - tH, end: frames[Math.min(s.endIdx, frames.length) - 1].t + tH, pitch: median(p), db };
   }).filter(s => s.end - s.start >= minLen);
   let offset = 0;
   if ($("tune").checked && segs.length) offset = median(segs.map(s => s.pitch - Math.round(s.pitch)));
   const tr = +$("transpose").value;
   notes = segs.map(s => ({
-    start: s.start, end: s.end,
+    start: s.start + tShift, end: s.end + tShift,
     midi: Math.max(0, Math.min(127, Math.round(s.pitch - offset) + tr)),
     vel: Math.round(Math.max(30, Math.min(120, 112 + s.db * 1.6)))
-  }));
+  })).filter(n => n.end > 0).map(n => (n.start < 0 ? { ...n, start: 0 } : n));
   $("tune").dataset.offset = offset;
 }
 const bpm = () => Math.max(30, Math.min(300, +$("bpm").value || 100));
@@ -375,7 +395,7 @@ function computeView(W, H) {
   let lo = src.length ? Math.floor(Math.min(...src)) - 3 : 55, hi = src.length ? Math.ceil(Math.max(...src)) + 3 : 72;
   if (hi - lo < 14) { const c = (hi + lo) / 2; lo = Math.floor(c - 7); hi = Math.ceil(c + 7); }
   const spb = 60 / bpm();
-  const dur = Math.max(4 * spb * 2, samples ? samples.length / SR : 0, notes.length ? Math.max(...notes.map(n => n.end)) : 0) + spb;
+  const dur = Math.max(4 * spb * 2, samples ? samples.length / SR + tShift : 0, notes.length ? Math.max(...notes.map(n => n.end)) : 0) + spb;
   const span = dur / zoomF; scrollT = Math.max(0, Math.min(scrollT, dur - span));
   return { W, H, lo, hi, dur, rh: H / (hi - lo + 1), t0: scrollT, span };
 }
@@ -420,8 +440,9 @@ function draw() {
   g2.save(); g2.beginPath(); g2.rect(GX, 0, W - GX, H); g2.clip();
   g2.strokeStyle = C.curve; g2.lineWidth = 1.5; g2.beginPath(); let prev = null;
   for (const f of frames) {
-    if (f.midi == null || f.t < t0 - 0.05 || f.t > tEnd + 0.05) { prev = null; continue; }
-    const x = X(f.t), y = Y(f.midi - off + tr) + rh / 2;
+    const ft = f.t + tShift;
+    if (f.midi == null || ft < t0 - 0.05 || ft > tEnd + 0.05) { prev = null; continue; }
+    const x = X(ft), y = Y(f.midi - off + tr) + rh / 2;
     if (prev && f.t - prev < 0.03) g2.lineTo(x, y); else g2.moveTo(x, y);
     prev = f.t;
   }
@@ -464,13 +485,14 @@ function renderList() {
 
 // ---------- history ----------
 let undoStack = [], redoStack = [];
-const snap = () => notes.map(n => ({ ...n }));
-const same = (a, b) => a.length === b.length && a.every((n, i) => n.start === b[i].start && n.end === b[i].end && n.midi === b[i].midi && n.vel === b[i].vel);
+const snap = () => ({ n: notes.map(n => ({ ...n })), s: tShift });
+const restore = x => { notes = x.n.map(n => ({ ...n })); tShift = x.s; };
+const same = (a, b) => a.s === b.s && a.n.length === b.n.length && a.n.every((n, i) => n.start === b.n[i].start && n.end === b.n[i].end && n.midi === b.n[i].midi && n.vel === b.n[i].vel);
 function pushUndo(s) { undoStack.push(s); if (undoStack.length > 200) undoStack.shift(); redoStack = []; markDirty(); }
-function afterEdit() { notes.sort((a, b) => a.start - b.start || a.midi - b.midi); if (!notes.includes(sel)) sel = null; draw(); renderList(); updButtons(); }
-function undo() { if (!undoStack.length) return; redoStack.push(snap()); notes = undoStack.pop(); sel = null; markDirty(); afterEdit(); status("Rückgängig gemacht."); }
-function redo() { if (!redoStack.length) return; undoStack.push(snap()); notes = redoStack.pop(); sel = null; markDirty(); afterEdit(); status("Wiederhergestellt."); }
-function edit(fn, msg) { const s = snap(); fn(); if (!same(s, notes)) { pushUndo(s); if (msg) status(msg); } afterEdit(); }
+function afterEdit() { notes.sort((a, b) => a.start - b.start || a.midi - b.midi); if (!notes.includes(sel)) sel = null; updShift(); draw(); renderList(); updButtons(); }
+function undo() { if (!undoStack.length) return; redoStack.push(snap()); restore(undoStack.pop()); sel = null; markDirty(); afterEdit(); status("Rückgängig gemacht."); }
+function redo() { if (!redoStack.length) return; undoStack.push(snap()); restore(redoStack.pop()); sel = null; markDirty(); afterEdit(); status("Wiederhergestellt."); }
+function edit(fn, msg) { const s = snap(); fn(); if (!same(s, snap())) { pushUndo(s); if (msg) status(msg); } afterEdit(); }
 function updButtons() {
   const has = notes.length > 0;
   $("playMidi").disabled = !has; $("exportBtn").disabled = !has; $("playOrig").disabled = !samples;
@@ -486,6 +508,18 @@ function redetect() {
   segment(); sel = null; afterEdit();
 }
 function refresh() { redetect(); }
+
+const fmtShift = () => { const v = Math.round(tShift * 1000); return (v > 0 ? "+" : v < 0 ? "−" : "±") + Math.abs(v) + " ms"; };
+function updShift() { $("shiftOut").textContent = fmtShift(); }
+function shiftTake(d) {
+  if (!samples) return;
+  edit(() => {
+    tShift = Math.round((tShift + d) * 1000) / 1000;
+    notes.forEach(n => { n.start += d; n.end += d; });
+    notes = notes.filter(n => n.end > 0); notes.forEach(n => { if (n.start < 0) n.start = 0; });
+  }, `Timing ${fmtShift()}.`);
+}
+for (const [id, d] of [["sh-50", -0.05], ["sh-10", -0.01], ["sh10", 0.01], ["sh50", 0.05]]) $(id).addEventListener("click", () => shiftTake(d));
 
 function quantize() {
   const g = grid(); if (!g) return;
@@ -531,7 +565,7 @@ cv.addEventListener("pointerdown", e => {
   if (!view) return;
   ptrs.set(e.pointerId, pos(e));
   if (ptrs.size === 2) { // pinch zoom: abandon whatever the first finger started
-    if (drag && drag.type !== "pan" && drag.type !== "pinch") { notes = drag.before; sel = null; }
+    if (drag && drag.type !== "pan" && drag.type !== "pinch") { restore(drag.before); sel = null; }
     const [a, b] = [...ptrs.values()];
     drag = { type: "pinch", d0: Math.hypot(a.x - b.x, a.y - b.y) || 1, z0: zoomF, tc: T((a.x + b.x) / 2) };
     cv.setPointerCapture(e.pointerId); draw(); renderList(); updButtons(); return;
@@ -658,6 +692,7 @@ async function load(x, name, demo, saved) {
   status("Analysiere Tonhöhe …");
   await new Promise(r => setTimeout(r, 20));
   frames = analyse(samples);
+  tShift = 0;
   if (saved?.settings) applySettings(saved.settings);
   zoomF = 1; scrollT = 0;
   undoStack = []; redoStack = []; sel = null; segment();
@@ -775,6 +810,144 @@ document.addEventListener("keydown", e => {
   if ((e.key === "t" || e.key === "T") && !e.repeat && !/INPUT|SELECT|TEXTAREA/.test(document.activeElement?.tagName || "")) tap();
 });
 
+// ---------- sample-accurate capture ----------
+// Each block carries the AudioContext time of its first sample, in the same clock the click is scheduled in.
+const CAP_SRC = `class TmCap extends AudioWorkletProcessor{
+ constructor(){super();this.n=0;this.b=new Float32Array(2048);this.t=0;this.on=true;this.z=new Float32Array(128);
+  this.port.onmessage=e=>{if(e.data==="flush"){this.send();this.port.postMessage({done:true});this.on=false;}};}
+ send(){if(this.n){this.port.postMessage({t:this.t,d:this.b.slice(0,this.n)});this.n=0;}}
+ process(inp){if(!this.on)return false;const c=(inp[0]&&inp[0][0])||this.z;
+  if(this.n&&Math.abs(currentTime-(this.t+this.n/sampleRate))>1e-4)this.send();
+  if(!this.n)this.t=currentTime;this.b.set(c,this.n);this.n+=c.length;if(this.n>=this.b.length)this.send();return true;}}
+registerProcessor("tm-cap",TmCap);`;
+const capModule = new WeakMap();
+function loadCapModule(ac) {
+  if (!capModule.has(ac)) capModule.set(ac, (async () => {
+    try { await ac.audioWorklet.addModule(URL.createObjectURL(new Blob([CAP_SRC], { type: "text/javascript" }))); }
+    catch { await ac.audioWorklet.addModule("data:text/javascript;charset=utf-8," + encodeURIComponent(CAP_SRC)); }
+  })());
+  return capModule.get(ac);
+}
+function assemble(chunks, sr) {
+  if (!chunks.length) return { first: 0, data: new Float32Array(0), sr };
+  const first = chunks[0].t, last = chunks[chunks.length - 1];
+  const len = Math.max(0, Math.round((last.t - first) * sr) + last.d.length), data = new Float32Array(len);
+  for (const c of chunks) { const p = Math.round((c.t - first) * sr); if (p >= 0 && p < len) data.set(c.d.subarray(0, Math.min(c.d.length, len - p)), p); }
+  return { first, data, sr };
+}
+async function startCapture(ac, srcNode) {
+  const chunks = [], sr = ac.sampleRate, mute = ac.createGain(); mute.gain.value = 0; mute.connect(ac.destination);
+  try {
+    if (!ac.audioWorklet || typeof AudioWorkletNode === "undefined") throw new Error("no worklet");
+    await loadCapModule(ac);
+    const node = new AudioWorkletNode(ac, "tm-cap", { numberOfInputs: 1, numberOfOutputs: 1 });
+    let done = null;
+    node.port.onmessage = e => { if (e.data.d) chunks.push(e.data); else if (e.data.done) done?.(); };
+    srcNode.connect(node); node.connect(mute);
+    return { kind: "worklet", stop: () => new Promise(r => { done = r; node.port.postMessage("flush"); setTimeout(r, 600); })
+      .then(() => { try { node.disconnect(); mute.disconnect(); } catch {} return assemble(chunks, sr); }) };
+  } catch {
+    capModule.delete(ac);
+    // fallback: the input of a ScriptProcessor block is two buffers older than its playbackTime
+    const BS = 4096, proc = ac.createScriptProcessor(BS, 1, 1);
+    proc.onaudioprocess = e => chunks.push({ t: e.playbackTime - 2 * BS / sr, d: new Float32Array(e.inputBuffer.getChannelData(0)) });
+    srcNode.connect(proc); proc.connect(mute);
+    return { kind: "script", stop: async () => { try { proc.disconnect(); mute.disconnect(); } catch {} return assemble(chunks, sr); } };
+  }
+}
+
+// ---------- latency: headphones, interface and microphone ----------
+const LAT_KEY = "tm-v2m-latency-ms";
+let latManual = null, latAutoMs = null;
+try { const v = localStorage.getItem(LAT_KEY); if (v != null && v !== "" && isFinite(+v)) latManual = +v; } catch {}
+function autoLatency(ac, stream) {
+  let inL = 0; try { inL = stream?.getAudioTracks?.()[0]?.getSettings?.().latency || 0; } catch {}
+  return (ac.baseLatency || 0) + (ac.outputLatency || 0) + inL;
+}
+function latencyFor(ac, stream) {
+  const a = autoLatency(ac, stream); latAutoMs = Math.round(a * 1000); updLatUI();
+  return latManual != null ? latManual / 1000 : a;
+}
+function updLatUI() {
+  const i = $("lat");
+  if (document.activeElement !== i) i.value = latManual != null ? latManual : "";
+  i.placeholder = latAutoMs != null ? "auto " + latAutoMs : "auto";
+}
+function setLatManual(v) {
+  latManual = v;
+  try { v == null ? localStorage.removeItem(LAT_KEY) : localStorage.setItem(LAT_KEY, String(v)); } catch {}
+  updLatUI();
+}
+$("lat").addEventListener("change", () => {
+  const v = $("lat").value.trim();
+  setLatManual(v === "" ? null : Math.max(-100, Math.min(800, Math.round(+v) || 0)));
+  status(latManual == null ? "Latenz-Ausgleich: automatisch (Gerätewerte des Browsers)." : `Latenz-Ausgleich: ${latManual} ms. Gilt ab der nächsten Aufnahme.`);
+});
+// onset of each sung «ta» relative to its click → total round-trip latency
+function measureOffsets({ first, data, sr }, clicks, spb) {
+  const hop = Math.max(1, Math.round(sr * 0.0025)), win = hop * 2, env = [];
+  for (let p = 0; p + win <= data.length; p += hop) { let e = 0; for (let i = p; i < p + win; i++) e += data[i] * data[i]; env.push(Math.sqrt(e / win)); }
+  if (env.length < 10) return { ok: false, msg: "Es kam kein Signal vom Mikrofon." };
+  const tOf = i => first + (i * hop + win / 2) / sr, idxOf = t => Math.round(((t - first) * sr - win / 2) / hop);
+  const floor = [...env].sort((a, b) => a - b)[Math.floor(env.length * 0.2)] || 1e-6;
+  const offs = [];
+  for (const c of clicks) {
+    const a = Math.max(1, idxOf(c - 0.12)), b = Math.min(env.length - 1, idxOf(c + Math.min(0.5, spb * 0.75)));
+    if (b <= a) continue;
+    let pk = 0; for (let i = a; i <= b; i++) pk = Math.max(pk, env[i]);
+    if (pk < floor * 6) continue;
+    const thr = Math.max(pk * 0.3, floor * 3);
+    let i = a; while (i <= b && !(env[i] >= thr && env[i - 1] < thr)) i++;
+    if (i > b) continue;
+    const fr = (thr - env[i - 1]) / Math.max(1e-9, env[i] - env[i - 1]);
+    offs.push(tOf(i - 1 + fr) - c);
+  }
+  if (offs.length < 6) return { ok: false, msg: `Nur ${offs.length} von ${clicks.length} Einsätzen erkannt. Näher ans Mikrofon und kurz und deutlich «ta» singen.` };
+  const med = median(offs), spread = median(offs.map(o => Math.abs(o - med)));
+  if (spread > 0.025) return { ok: false, msg: `Die Einsätze streuen zu stark (±${Math.round(spread * 1000)} ms). Nochmals, möglichst genau auf den Klick.` };
+  return { ok: true, ms: Math.max(-100, Math.min(800, Math.round(med * 1000))), spread: Math.round(spread * 1000), n: offs.length, total: clicks.length };
+}
+let calibrating = false;
+$("calBtn").addEventListener("click", async () => {
+  if (calibrating || rec) return;
+  stopPlay();
+  let stream;
+  try {
+    if (!navigator.mediaDevices?.getUserMedia) throw new Error("none");
+    stream = await navigator.mediaDevices.getUserMedia({ audio: { echoCancellation: false, noiseSuppression: false, autoGainControl: false } });
+  } catch { status("Kein Zugriff aufs Mikrofon. Ohne Mikrofon lässt sich die Latenz nicht messen.", true); return; }
+  const ac = audio(); await ac.resume();
+  calibrating = true; $("calBtn").disabled = true; $("recBtn").disabled = true;
+  const wasClick = clk.on; if (wasClick) stopClick();
+  const src = ac.createMediaStreamSource(stream);
+  try {
+    const cap = await startCapture(ac, src);
+    latencyFor(ac, stream);
+    const spb = 60 / 90, PRE = 4, N = 16, t0 = ac.currentTime + 0.4, times = [];
+    for (let k = 0; k < N; k++) {
+      const t = t0 + k * spb; times.push(t); tock(t, k % 4 === 0);
+      setTimeout(() => {
+        beatDots.forEach((d, i) => d.classList.toggle("on", i === k % 4));
+        status(k < PRE ? `Latenz messen: zuhören … ${k + 1}` : `Jetzt kurz «ta» auf jeden Klick · ${k - PRE + 1} / ${N - PRE}`);
+      }, Math.max(0, (t - ac.currentTime) * 1000));
+    }
+    status("Latenz messen: vier Klicks zuhören, dann auf jeden Klick kurz «ta» singen.");
+    await new Promise(r => setTimeout(r, (t0 + N * spb + 0.5 - ac.currentTime) * 1000));
+    const res = measureOffsets(await cap.stop(), times.slice(PRE), spb);
+    if (res.ok) {
+      setLatManual(res.ms);
+      status(`Latenz gemessen: ${res.ms} ms (${res.n} von ${res.total} Einsätzen, Streuung ±${res.spread} ms). Gilt ab der nächsten Aufnahme, bis du das Setup wechselst.`);
+    } else status(res.msg, true);
+  } catch { status("Die Messung ist fehlgeschlagen.", true); }
+  finally {
+    stream.getTracks().forEach(t => t.stop()); try { src.disconnect(); } catch {}
+    beatDots.forEach(d => d.classList.remove("on"));
+    calibrating = false; $("calBtn").disabled = false; $("recBtn").disabled = false;
+    if (wasClick) startClick(ac.currentTime + 0.05);
+  }
+});
+updLatUI();
+
 // ---------- recording + live tuner ----------
 let rec = null;
 let recArm = 0;
@@ -801,22 +974,20 @@ $("recBtn").addEventListener("click", async () => {
   let wake = null; try { wake = await navigator.wakeLock?.request("screen"); } catch {}
   const srcNode = ac.createMediaStreamSource(stream);
   const an = ac.createAnalyser(); an.fftSize = 2048; srcNode.connect(an);
-  // sample-accurate capture in the same clock as the click
-  const proc = ac.createScriptProcessor(4096, 1, 1), mute = ac.createGain(); mute.gain.value = 0;
-  const chunks = [];
-  proc.onaudioprocess = e => chunks.push({ t: e.playbackTime, d: new Float32Array(e.inputBuffer.getChannelData(0)) });
-  srcNode.connect(proc); proc.connect(mute); mute.connect(ac.destination);
+  const cap = await startCapture(ac, srcNode);
   const withClick = clk.on, countIn = withClick && $("countin").checked, spb = 60 / bpm();
+  const L = withClick ? latencyFor(ac, stream) : 0;
   const startAt = ac.currentTime + 0.1, origin = startAt + (countIn ? 4 * spb : 0);
   if (withClick) {
     startClick(origin, countIn ? -4 : 0);
     if (countIn) { clk.onBeat = b => { if (b < 0) status(`Einzählen … ${b + 5}`); else if (b === 0) { status("Aufnahme läuft."); clk.onBeat = null; } }; status("Einzählen …"); }
   }
   const mr = {
-    stop() {
-      proc.disconnect(); mute.disconnect(); clk.onBeat = null;
+    async stop() {
+      if (this.stopping) return; this.stopping = true;
+      clk.onBeat = null;
       if (!clk.on) stopClick();
-      this.onstop();
+      this.onstop(await cap.stop());
     }
   };
   const buf = new Float32Array(2048), d = new Float32Array(2048);
@@ -831,19 +1002,18 @@ $("recBtn").addEventListener("click", async () => {
     const f = Math.sqrt(e / buf.length) > 0.01 ? yinLive(buf, ac.sampleRate, d) : 0;
     showTuner(f);
   };
-  mr.onstop = async () => {
+  mr.onstop = async capRes => {
     cancelAnimationFrame(raf); stream.getTracks().forEach(t => t.stop()); srcNode.disconnect();
     try { wake?.release(); } catch {}
     rec = null; $("recBtn").classList.remove("on"); $("recLabel").textContent = "Aufnehmen"; showTuner(0);
     try {
-      // time zero = first downbeat (with click) or the moment recording started; compensate output latency
-      const sr = ac.sampleRate, lat = withClick ? (ac.outputLatency || ac.baseLatency || 0) : 0;
-      const t0 = withClick ? origin + lat : startAt;
-      const total = chunks.reduce((a, c) => a + c.d.length, 0);
-      const all = new Float32Array(total); let p = 0; for (const c of chunks) { all.set(c.d, p); p += c.d.length; }
-      const first = chunks.length ? chunks[0].t : t0;
-      const skip = Math.max(0, Math.round((t0 - first) * sr));
-      const body = all.subarray(Math.min(skip, all.length));
+      // time zero = first downbeat as heard and sung back (click + round-trip latency), else the moment recording started
+      const { first, data: all, sr } = capRes;
+      const t0 = withClick ? origin + L : startAt;
+      const skip = Math.round((t0 - first) * sr);
+      let body;
+      if (skip >= 0) body = all.subarray(Math.min(skip, all.length));
+      else { body = new Float32Array(all.length - skip); body.set(all, -skip); }
       if (body.length < sr * 0.2) { status("Die Aufnahme war zu kurz.", true); return; }
       const ab = ac.createBuffer(1, body.length, sr); ab.copyToChannel(body, 0);
       await load(await resample(ab), defaultName(), false);
@@ -883,10 +1053,10 @@ $("playOrig").addEventListener("click", async () => {
   stopPlay(); const ac = audio(); await ac.resume();
   const b = ac.createBuffer(1, samples.length, SR); b.copyToChannel(samples, 0);
   const s = ac.createBufferSource(); s.buffer = b; s.connect(ac.destination);
-  const start = ac.currentTime + 0.05; s.start(start);
+  const start = ac.currentTime + 0.05; s.start(start + Math.max(0, tShift), Math.max(0, -tShift));
   if (clk.on) startClick(start);
   playing = { stop() { try { s.stop(); } catch {} cancelAnimationFrame(this.raf); } };
-  runHead(start, samples.length / SR);
+  runHead(start, samples.length / SR + tShift);
 });
 $("playMidi").addEventListener("click", async () => {
   stopPlay(); const ac = audio(); await ac.resume();
@@ -990,13 +1160,14 @@ const idb = (() => {
 let takesCache = [], storageOk = true;
 const defaultName = () => { const d = new Date(), p = v => String(v).padStart(2, "0"); return `Aufnahme ${d.getDate()}.${d.getMonth() + 1}. ${p(d.getHours())}:${p(d.getMinutes())}`; };
 const fileBase = () => ($("takeName").value.trim() || srcName || "melodie").replace(/[\\/:*?"<>|]+/g, "-").replace(/\s+/g, "_");
-function getSettings() { return { bpm: bpm(), raster: $("raster").value, transpose: +$("transpose").value, gate: +$("gate").value, minLen: +$("minLen").value, split: +$("split").value, tune: $("tune").checked }; }
+function getSettings() { return { bpm: bpm(), raster: $("raster").value, transpose: +$("transpose").value, gate: +$("gate").value, minLen: +$("minLen").value, split: +$("split").value, tune: $("tune").checked, tShift }; }
 function applySettings(s) {
   if (s.bpm) { $("bpm").value = s.bpm; reanchor(); }
   if (s.raster != null) $("raster").value = s.raster;
   for (const k of ["gate", "minLen", "split"]) if (s[k] != null) { $(k).value = s[k]; $(k + "Out").textContent = outs[k]($(k).value); }
   if (s.tune != null) $("tune").checked = s.tune;
   if (s.transpose != null) { $("transpose").value = s.transpose; lastTr = +s.transpose; }
+  if (s.tShift != null) tShift = +s.tShift || 0;
 }
 function markDirty() { dirty = true; updTakeState(); }
 function updTakeState() {
@@ -1049,7 +1220,7 @@ async function saveTake(asNew) {
     const old = id ? list.find(m => m.id === id) : null;
     const nid = id || Date.now().toString(36) + Math.random().toString(36).slice(2, 6);
     const name = $("takeName").value.trim() || defaultName();
-    const meta = { id: nid, name, created: old?.created ?? Date.now(), updated: Date.now(), dur: samples.length / SR, count: notes.length, notes: snap(), settings: getSettings() };
+    const meta = { id: nid, name, created: old?.created ?? Date.now(), updated: Date.now(), dur: samples.length / SR, count: notes.length, notes: notes.map(n => ({ ...n })), settings: getSettings() };
     let audioRec = null;
     if (!old) { const pcm = new Int16Array(samples.length); for (let i = 0; i < pcm.length; i++) pcm[i] = Math.max(-32768, Math.min(32767, Math.round(samples[i] * 32767))); audioRec = { id: nid, sr: SR, pcm }; }
     await idb.put(meta, audioRec);
